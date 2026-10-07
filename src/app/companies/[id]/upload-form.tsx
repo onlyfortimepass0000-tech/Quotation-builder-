@@ -1,24 +1,102 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { rasterizePdfFileToPngPages } from "@/lib/pdf/rasterize-client";
-import { cropRegionFromPngBase64, getPngDimensions } from "@/lib/pdf/crop-client";
-import type { AssetLocation } from "@/lib/ai/types";
+import { upload } from "@vercel/blob/client";
+import { openPdf, type OpenedPdf, type RenderedPage } from "@/lib/pdf/rasterize-client";
+import { cropRegionFromPngBase64 } from "@/lib/pdf/crop-client";
+import { sampleKey } from "@/lib/storage/keys";
+import type { AssetLocation, ExtractionResult } from "@/lib/ai/types";
 
 /** Asset detection is best-effort and occasionally slow/flaky (a separate
  *  model call, measured 16-28s+ just on its own under normal load) — give
  *  up after this long rather than let it hold up analysis indefinitely.
- *  It now runs IN PARALLEL with analysis (not before it), so this timeout
- *  rarely matters in practice — worst case is max(this, analysis time),
- *  not their sum, which is what pushed total time past 2 minutes before. */
+ *  It runs IN PARALLEL with page reading, so this timeout rarely matters. */
 const ASSET_DETECTION_TIMEOUT_MS = 40_000;
 
-async function detectAndCropAssets(
-  companyId: string,
-  firstPage: string
-): Promise<{ logoCropBase64?: string; signatureCropBase64?: string } | null> {
-  const { width, height } = await getPngDimensions(firstPage);
+/** Pages read at the same time. Enough to be fast, few enough to stay
+ *  inside the free NVIDIA keys' rate limits. */
+const PAGE_CONCURRENCY = 4;
+/** Each page gets this many tries (the server also retries rate limits). */
+const PAGE_ATTEMPTS = 3;
+const MAX_FILES = 10;
+const MAX_PAGES_PER_FILE = 200;
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+/** Files bigger than this upload in parallel chunks. */
+const MULTIPART_THRESHOLD_BYTES = 8 * 1024 * 1024;
+
+type Crops = { logoCropBase64?: string; signatureCropBase64?: string };
+
+/** What's already been done for one selected file, so a retry after a
+ *  failure (busy AI, dropped connection) only redoes what's missing. */
+interface FileProgress {
+  blobUrl?: string;
+  pages: Array<ExtractionResult | undefined>;
+}
+
+function fileKey(file: File) {
+  return `${file.name}:${file.size}:${file.lastModified}`;
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Like res.json(), but a non-JSON error page (e.g. a platform 413/504)
+ *  becomes a readable message instead of "Unexpected token <". */
+async function readJson<T>(res: Response): Promise<T & { error?: string }> {
+  const text = await res.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    const error =
+      res.status === 413
+        ? "That request was too large for the server."
+        : res.status === 504
+          ? "The server took too long to answer. Please try again."
+          : `Server error (${res.status}). Please try again.`;
+    return { error } as T & { error?: string };
+  }
+}
+
+async function extractPage(companyId: string, page: RenderedPage): Promise<ExtractionResult> {
+  let lastError = "the AI service didn't respond";
+  for (let attempt = 1; attempt <= PAGE_ATTEMPTS; attempt++) {
+    try {
+      const res = await fetch(`/api/companies/${companyId}/extract-page`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageBase64: page.jpegBase64,
+          mimeType: "image/jpeg",
+          pageIndex: page.pageIndex,
+          knownText: page.textLayer ?? undefined,
+        }),
+      });
+      const json = await readJson<{ extraction?: ExtractionResult }>(res);
+      if (res.ok && json.extraction) return json.extraction;
+      lastError = json.error ?? `server error ${res.status}`;
+      // Bad request / AI not configured won't fix themselves on a retry.
+      if (res.status === 400 || res.status === 503) break;
+    } catch {
+      lastError = "network connection lost";
+    }
+    if (attempt < PAGE_ATTEMPTS) await sleep(attempt * 3000);
+  }
+  // A digital page's text is already exact — only the layout note is
+  // missing, so don't fail the whole analysis over it.
+  if (page.textLayer) {
+    return {
+      rawText: page.textLayer,
+      layoutHints: { description: `page ${page.pageIndex + 1}: (layout not available)` },
+    };
+  }
+  throw new Error(lastError);
+}
+
+async function detectAndCropAssets(companyId: string, page: RenderedPage): Promise<Crops | null> {
+  if (!page.png) return null;
+  const png = page.png;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ASSET_DETECTION_TIMEOUT_MS);
   let detectRes: Response;
@@ -26,7 +104,12 @@ async function detectAndCropAssets(
     detectRes = await fetch(`/api/companies/${companyId}/detect-assets`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ pngBase64: firstPage, width, height }),
+      body: JSON.stringify({
+        imageBase64: page.jpegBase64,
+        mimeType: "image/jpeg",
+        width: page.jpegWidth,
+        height: page.jpegHeight,
+      }),
       signal: controller.signal,
     });
   } catch {
@@ -37,16 +120,36 @@ async function detectAndCropAssets(
   if (!detectRes.ok) return null;
 
   const { assets } = (await detectRes.json()) as { assets: AssetLocation };
-  const result: { logoCropBase64?: string; signatureCropBase64?: string } = {};
+  // Boxes come back in JPEG pixels; the JPEG may have been scaled down to
+  // fit the upload limit, so map them onto the full-size PNG.
+  const sx = png.width / page.jpegWidth;
+  const sy = png.height / page.jpegHeight;
+  const toPng = (b: { x: number; y: number; width: number; height: number }) => ({
+    x: b.x * sx,
+    y: b.y * sy,
+    width: b.width * sx,
+    height: b.height * sy,
+  });
+  const result: Crops = {};
   if (assets.logo.present && assets.logo.box) {
-    const crop = await cropRegionFromPngBase64(firstPage, assets.logo.box, width, height);
+    const crop = await cropRegionFromPngBase64(png.base64, toPng(assets.logo.box), png.width, png.height);
     if (crop) result.logoCropBase64 = crop;
   }
   if (assets.signature.present && assets.signature.box) {
-    const crop = await cropRegionFromPngBase64(firstPage, assets.signature.box, width, height);
+    const crop = await cropRegionFromPngBase64(
+      png.base64,
+      toPng(assets.signature.box),
+      png.width,
+      png.height
+    );
     if (crop) result.signatureCropBase64 = crop;
   }
   return Object.keys(result).length > 0 ? result : null;
+}
+
+function describePages(indexes: number[]) {
+  const nums = indexes.map((i) => i + 1);
+  return nums.length === 1 ? `page ${nums[0]}` : `pages ${nums.join(", ")}`;
 }
 
 export default function UploadForm({
@@ -64,6 +167,7 @@ export default function UploadForm({
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const progress = useRef(new Map<string, FileProgress>());
   const router = useRouter();
 
   async function onSubmit(e: React.FormEvent) {
@@ -72,46 +176,129 @@ export default function UploadForm({
     setBusy(true);
     setError(null);
     let ticker: ReturnType<typeof setInterval> | undefined;
+    const opened: OpenedPdf[] = [];
     try {
-      setStatus("Rendering PDF pages in your browser…");
-      const pngPagesPerFile: string[][] = [];
+      if (files.length > MAX_FILES) throw new Error(`Please upload at most ${MAX_FILES} PDFs at a time.`);
       for (const file of files) {
-        pngPagesPerFile.push(await rasterizePdfFileToPngPages(file));
+        if (file.size > MAX_FILE_BYTES) {
+          throw new Error(`"${file.name}" is over ${MAX_FILE_BYTES / 1024 / 1024} MB. Please upload a smaller PDF.`);
+        }
       }
 
-      const form = new FormData();
-      for (const file of files) form.append("file", file);
-      form.append("pngPagesJson", JSON.stringify(pngPagesPerFile));
-      form.append("updateBranding", String(updateBranding));
+      setStatus("Opening PDF…");
+      const docs: Array<{ file: File; pdf: OpenedPdf; state: FileProgress }> = [];
+      for (const file of files) {
+        const pdf = await openPdf(file);
+        opened.push(pdf);
+        if (pdf.numPages > MAX_PAGES_PER_FILE) {
+          throw new Error(`"${file.name}" has ${pdf.numPages} pages; the limit is ${MAX_PAGES_PER_FILE}.`);
+        }
+        const key = fileKey(file);
+        let state = progress.current.get(key);
+        if (!state || state.pages.length !== pdf.numPages) {
+          state = { pages: new Array(pdf.numPages).fill(undefined) };
+          progress.current.set(key, state);
+        }
+        docs.push({ file, pdf, state });
+      }
 
-      // Asset detection (a separate, sometimes-slow model call) and the main
-      // analysis (Stage A + B) are independent — run them concurrently
-      // instead of blocking one on the other. If detection is still running
-      // when analysis finishes, we don't wait on it further; the crop gets
-      // attached in the background via a quick follow-up call instead of
-      // holding up the redirect.
-      setStatus("Reading your PDF and learning the template (usually 30-60s)…");
+      // 1. The PDFs themselves go straight to Blob storage from the browser,
+      //    so their size never hits the server's request limit.
+      const uploads = Promise.all(
+        docs.map(async ({ file, state }) => {
+          if (state.blobUrl) return;
+          const blob = await upload(sampleKey(companyId, crypto.randomUUID(), file.name), file, {
+            access: "public",
+            handleUploadUrl: `/api/companies/${companyId}/upload-sample`,
+            contentType: "application/pdf",
+            multipart: file.size > MULTIPART_THRESHOLD_BYTES,
+          });
+          state.blobUrl = blob.url;
+        })
+      );
+      // Don't surface as unhandled while pages are still being read.
+      uploads.catch(() => {});
+
+      // 2. Logo/signature detection on page 1, alongside page reading.
+      const assetPromise: Promise<Crops | null> = updateBranding
+        ? docs[0].pdf
+            .renderPage(0, { withPng: true })
+            .then((page) => detectAndCropAssets(companyId, page))
+            .catch(() => null)
+        : Promise.resolve(null);
+
+      // 3. Read every page of every file, a few at a time.
+      const tasks = docs.flatMap((doc, d) =>
+        doc.state.pages.flatMap((done, p) => (done ? [] : [{ d, p }]))
+      );
+      const totalPages = docs.reduce((n, doc) => n + doc.pdf.numPages, 0);
+      let finished = totalPages - tasks.length;
+      const failed = new Map<number, number[]>();
+      const reasons = new Set<string>();
+      const showProgress = () =>
+        setStatus(`Reading pages… ${finished} of ${totalPages} done`);
+      showProgress();
+      let next = 0;
+      await Promise.all(
+        Array.from({ length: Math.min(PAGE_CONCURRENCY, tasks.length) }, async () => {
+          while (next < tasks.length) {
+            const { d, p } = tasks[next++];
+            const doc = docs[d];
+            try {
+              const page = await doc.pdf.renderPage(p);
+              doc.state.pages[p] = await extractPage(companyId, page);
+            } catch (err) {
+              failed.set(d, [...(failed.get(d) ?? []), p]);
+              reasons.add(err instanceof Error ? err.message : String(err));
+            }
+            finished++;
+            showProgress();
+          }
+        })
+      );
+      if (failed.size > 0) {
+        const parts = [...failed.entries()].map(
+          ([d, pages]) => `${describePages(pages.sort((a, b) => a - b))} of "${docs[d].file.name}"`
+        );
+        throw new Error(
+          `Couldn't read ${parts.join("; ")} (${[...reasons].slice(0, 2).join("; ")}). Click Analyze again; pages already read won't be redone.`
+        );
+      }
+
+      setStatus("Finishing upload…");
+      try {
+        await uploads;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "";
+        throw new Error(`Uploading the PDF failed${reason ? ` (${reason})` : ""}. Click Analyze again to retry.`);
+      }
+
+      // 4. Learn the template from everything that was read.
       const startedAt = Date.now();
+      setStatus("Learning the template…");
       ticker = setInterval(() => {
         const s = Math.round((Date.now() - startedAt) / 1000);
-        setStatus(`Reading your PDF and learning the template… ${s}s (usually 30-60s)`);
+        setStatus(`Learning the template… ${s}s (usually 15-60s)`);
       }, 1000);
-      const firstPage = pngPagesPerFile[0]?.[0];
-      const assetPromise =
-        updateBranding && firstPage ? detectAndCropAssets(companyId, firstPage) : Promise.resolve(null);
-      const analyzePromise = fetch(`/api/companies/${companyId}/analyze`, {
+      const res = await fetch(`/api/companies/${companyId}/analyze`, {
         method: "POST",
-        body: form,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          samples: docs.map(({ file, state }) => ({
+            blobUrl: state.blobUrl,
+            originalFilename: file.name,
+            pages: state.pages,
+          })),
+          updateBranding,
+        }),
       });
-
-      const res = await analyzePromise;
-      const json = (await res.json()) as {
-        error?: string;
-        templateVersion?: { id: string };
-      };
-      if (!res.ok || !json.templateVersion) throw new Error(json.error ?? "Analysis failed");
+      const json = await readJson<{ templateVersion?: { id: string } }>(res);
+      if (!res.ok || !json.templateVersion) {
+        throw new Error(`${json.error ?? "Analysis failed"} Click Analyze again to retry.`);
+      }
       const versionId = json.templateVersion.id;
       clearInterval(ticker);
+      for (const { file } of docs) progress.current.delete(fileKey(file));
 
       // Attach whatever asset detection found, if anything — but never let
       // it delay getting the reviewer to the result they're waiting for.
@@ -134,6 +321,7 @@ export default function UploadForm({
       setStatus(null);
     } finally {
       if (ticker) clearInterval(ticker);
+      await Promise.all(opened.map((pdf) => pdf.destroy().catch(() => {})));
       setBusy(false);
     }
   }

@@ -1,5 +1,11 @@
-import type { ExtractionResult, ImageToTextProvider, TextAnalysisProvider } from "@/lib/ai/types";
-import { EXTRACTION_PROMPT, STAGE_B_SYSTEM_PROMPT, buildStageBUserPrompt } from "@/lib/ai/prompts";
+import type { ExtractionResult, ImageToTextProvider, PageImage, TextAnalysisProvider } from "@/lib/ai/types";
+import {
+  EXTRACTION_PROMPT,
+  LAYOUT_ONLY_PROMPT,
+  STAGE_B_SYSTEM_PROMPT,
+  buildStageBUserPrompt,
+  parseExtractionReply,
+} from "@/lib/ai/prompts";
 import { extractJsonObject } from "@/lib/ai/nvidia-nim";
 import { parseStageBOutput, MAX_VARIABLE_FIELDS, type StageBResult } from "@/lib/template-schema";
 
@@ -53,24 +59,21 @@ class QwenVisionProvider implements ImageToTextProvider {
     return config().available;
   }
 
-  async extractFromImage(pngBase64: string, pageIndex: number): Promise<ExtractionResult> {
+  async extractFromImage(page: PageImage): Promise<ExtractionResult> {
+    const layoutOnly = page.knownText !== undefined;
     const content = await qwenChatCompletion(
       [
         {
           role: "user",
           content: [
-            { type: "text", text: EXTRACTION_PROMPT },
-            { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64}` } },
+            { type: "text", text: layoutOnly ? LAYOUT_ONLY_PROMPT : EXTRACTION_PROMPT },
+            { type: "image_url", image_url: { url: `data:${page.mimeType};base64,${page.base64}` } },
           ],
         },
       ],
-      2000
+      layoutOnly ? 120 : 3000
     );
-    const layoutMarker = content.lastIndexOf("LAYOUT:");
-    const rawText = (layoutMarker === -1 ? content : content.slice(0, layoutMarker)).trim();
-    const description =
-      layoutMarker === -1 ? "(no layout description returned)" : content.slice(layoutMarker + 7).trim();
-    return { rawText, layoutHints: { description: `page ${pageIndex + 1}: ${description}` } };
+    return parseExtractionReply(content, page.pageIndex, page.knownText);
   }
 }
 

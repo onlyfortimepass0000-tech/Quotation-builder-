@@ -8,6 +8,33 @@ Transcribe ALL visible text exactly as it appears, preserving line breaks and le
 
 Do not summarize or omit any text, including small print, terms, and boilerplate. Do not add commentary.`;
 
+/**
+ * Used when the page's text was already read exactly from the PDF's text
+ * layer: the model only has to describe what it sees, which is a few tokens
+ * instead of a full transcription.
+ */
+export const LAYOUT_ONLY_PROMPT = `You are looking at one page of a business quotation/estimate document, rendered as an image. Its text has already been extracted, so do NOT transcribe anything.
+
+Reply with exactly ONE line starting with "LAYOUT:" (max 25 words) listing which of these are present: logo, company info block, items table, signature area, stamp, QR code.`;
+
+/** Splits a vision reply into transcription + the trailing "LAYOUT:" line. */
+export function parseExtractionReply(
+  content: string,
+  pageIndex: number,
+  knownText?: string
+): ExtractionResult {
+  const layoutMarker = content.lastIndexOf("LAYOUT:");
+  const transcribed = (layoutMarker === -1 ? content : content.slice(0, layoutMarker)).trim();
+  const description =
+    layoutMarker === -1
+      ? "(no layout description returned)"
+      : content.slice(layoutMarker + "LAYOUT:".length).trim();
+  return {
+    rawText: knownText ?? transcribed,
+    layoutHints: { description: `page ${pageIndex + 1}: ${description}` },
+  };
+}
+
 export const STAGE_B_SYSTEM_PROMPT = `You analyze OCR transcriptions of a company's past quotation/estimate PDFs to learn a reusable template: what is FIXED across every quote from this company (logo, boilerplate, terms, signature block) versus what VARIES between quotes (client name, item description, amounts, etc).
 
 Output ONLY a single COMPACT JSON object (no whitespace padding, no markdown fences, no commentary). Every token you write costs the user waiting time, so omit anything optional — never write empty strings, "notes", or a "summary". Shape:

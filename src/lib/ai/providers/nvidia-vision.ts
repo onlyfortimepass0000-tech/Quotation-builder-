@@ -1,6 +1,6 @@
-import type { ExtractionResult, ImageToTextProvider } from "@/lib/ai/types";
+import type { ExtractionResult, ImageToTextProvider, PageImage } from "@/lib/ai/types";
 import { nimChatCompletion } from "@/lib/ai/nvidia-nim";
-import { EXTRACTION_PROMPT } from "@/lib/ai/prompts";
+import { EXTRACTION_PROMPT, LAYOUT_ONLY_PROMPT, parseExtractionReply } from "@/lib/ai/prompts";
 
 /**
  * meta/llama-3.2-11b-vision-instruct on NVIDIA NIM (integrate.api.nvidia.com) —
@@ -23,42 +23,47 @@ export class NvidiaVisionProvider implements ImageToTextProvider {
     this.available = opts?.available ?? true;
   }
 
-  async extractFromImage(pngBase64: string, pageIndex: number): Promise<ExtractionResult> {
-    const content = await nimChatCompletion({
-      model: this.model,
-      maxTokens: 2000,
-      // Image payloads genuinely take longer than the text-only default
-      // budget assumes — measured 16-24s under normal load for a single
-      // page, right at the edge of (and sometimes past) a 25s timeout.
-      // Give it real headroom instead of false-timing-out a call that was
-      // about to succeed.
-      timeoutMs: 40_000,
-      maxAttempts: 2,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: EXTRACTION_PROMPT },
-            {
-              type: "image_url",
-              image_url: { url: `data:image/png;base64,${pngBase64}` },
-            },
-          ],
-        },
-      ],
-    });
+  async extractFromImage(page: PageImage): Promise<ExtractionResult> {
+    const layoutOnly = page.knownText !== undefined;
+    const ask = (prompt: string, maxTokens: number, timeoutMs: number) =>
+      nimChatCompletion({
+        model: this.model,
+        maxTokens,
+        timeoutMs,
+        maxAttempts: 2,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: prompt },
+              {
+                type: "image_url",
+                image_url: { url: `data:${page.mimeType};base64,${page.base64}` },
+              },
+            ],
+          },
+        ],
+      });
 
-    const layoutMarker = content.lastIndexOf("LAYOUT:");
-    const rawText = (layoutMarker === -1 ? content : content.slice(0, layoutMarker)).trim();
-    const description =
-      layoutMarker === -1
-        ? "(no layout description returned)"
-        : content.slice(layoutMarker + "LAYOUT:".length).trim();
+    if (layoutOnly) {
+      // The text is already exact; the layout line is a nice-to-have for
+      // Stage B (logo/signature slots). Never fail the page over it.
+      try {
+        const content = await ask(LAYOUT_ONLY_PROMPT, 120, 30_000);
+        return parseExtractionReply(content, page.pageIndex, page.knownText);
+      } catch {
+        return {
+          rawText: page.knownText!,
+          layoutHints: { description: `page ${page.pageIndex + 1}: (layout not available)` },
+        };
+      }
+    }
 
-    return {
-      rawText,
-      layoutHints: { description: `page ${pageIndex + 1}: ${description}` },
-    };
+    // Full transcription. Image payloads measured 16-24s under normal load
+    // for a single page; dense scanned pages need the extra token headroom
+    // so the transcription isn't cut off mid-page.
+    const content = await ask(EXTRACTION_PROMPT, 3000, 50_000);
+    return parseExtractionReply(content, page.pageIndex);
   }
 }
 

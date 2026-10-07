@@ -1,4 +1,4 @@
-import type { ExtractionResult, ImageToTextProvider, TextAnalysisProvider } from "@/lib/ai/types";
+import type { ExtractionResult, ImageToTextProvider, PageImage, TextAnalysisProvider } from "@/lib/ai/types";
 import type { StageBResult } from "@/lib/template-schema";
 
 /**
@@ -12,9 +12,9 @@ class MockVisionProvider implements ImageToTextProvider {
   readonly label = "Mock (offline, deterministic)";
   readonly available = true;
 
-  async extractFromImage(_pngBase64: string, pageIndex: number): Promise<ExtractionResult> {
+  async extractFromImage({ pageIndex, knownText }: PageImage): Promise<ExtractionResult> {
     return {
-      rawText: [
+      rawText: knownText ?? [
         "Acme Fabricators Pvt Ltd",
         "221B Industrial Rd, Pune",
         "GSTIN: 27ABCDE1234F1Z5",

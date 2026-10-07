@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { AssetLocation, AssetLocatorProvider } from "@/lib/ai/types";
+import type { AssetLocation, AssetLocatorProvider, PageImage } from "@/lib/ai/types";
 import { nimChatCompletion, extractJsonObject } from "@/lib/ai/nvidia-nim";
 import { getEnv } from "@/db/client";
 
@@ -56,7 +56,8 @@ class NvidiaOmniAssetLocator implements AssetLocatorProvider {
   readonly available = true;
 
   async locateAssets(
-    pngBase64: string,
+    imageBase64: string,
+    mimeType: PageImage["mimeType"],
     imageWidth: number,
     imageHeight: number
   ): Promise<AssetLocation> {
@@ -81,7 +82,7 @@ class NvidiaOmniAssetLocator implements AssetLocatorProvider {
           role: "user",
           content: [
             { type: "text", text: buildPrompt(imageWidth, imageHeight) },
-            { type: "image_url", image_url: { url: `data:image/png;base64,${pngBase64}` } },
+            { type: "image_url", image_url: { url: `data:${mimeType};base64,${imageBase64}` } },
           ],
         },
       ],

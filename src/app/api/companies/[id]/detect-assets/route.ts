@@ -7,7 +7,7 @@ export const maxDuration = 60;
 
 /**
  * Lightweight, single-call pre-flight: given one rasterized page (base64
- * PNG + its pixel dimensions), ask the asset-locator model for approximate
+ * JPEG/PNG + its pixel dimensions), ask the asset-locator model for approximate
  * logo/signature bounding boxes. Returns coordinates only — nothing is
  * cropped or stored here. The client uses these to crop from the same
  * canvas it already rendered, then includes the crops in the main
@@ -16,18 +16,20 @@ export const maxDuration = 60;
  */
 export async function POST(req: Request) {
   const body = (await req.json().catch(() => null)) as {
-    pngBase64?: string;
+    imageBase64?: string;
+    mimeType?: string;
     width?: number;
     height?: number;
   } | null;
 
-  if (!body?.pngBase64 || !body.width || !body.height) {
-    return NextResponse.json({ error: "pngBase64, width, height are required" }, { status: 400 });
+  const mimeType = body?.mimeType === "image/png" ? "image/png" : "image/jpeg";
+  if (!body?.imageBase64 || !body.width || !body.height) {
+    return NextResponse.json({ error: "imageBase64, width, height are required" }, { status: 400 });
   }
 
   try {
     const locator = await getActiveAssetLocatorProvider();
-    const result = await locator.locateAssets(body.pngBase64, body.width, body.height);
+    const result = await locator.locateAssets(body.imageBase64, mimeType, body.width, body.height);
     return NextResponse.json({ assets: result });
   } catch (err) {
     if (err instanceof ProviderUnavailableError) {

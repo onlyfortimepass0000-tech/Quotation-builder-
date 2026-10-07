@@ -39,7 +39,9 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const RETRYABLE_STATUS = new Set([502, 503, 504]);
+// 429 = per-key rate limit on the free tier; a retry goes out on the next
+// key in the pool, which usually clears it.
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 
 export async function nimChatCompletion(opts: {
   model: string;
@@ -64,7 +66,6 @@ export async function nimChatCompletion(opts: {
   /** Total attempts including the first try (each with its own timeoutMs). */
   maxAttempts?: number;
 }): Promise<string> {
-  const apiKey = opts.apiKeyOverride ?? (await nextApiKey());
   const timeoutMs = opts.timeoutMs ?? 25_000;
 
   // Shared NVIDIA-hosted endpoints intermittently 503 ("Worker local total
@@ -76,6 +77,7 @@ export async function nimChatCompletion(opts: {
   const maxAttempts = opts.maxAttempts ?? 2;
   let lastError: Error | null = null;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const apiKey = opts.apiKeyOverride ?? (await nextApiKey());
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res: Response;
@@ -105,7 +107,7 @@ export async function nimChatCompletion(opts: {
     }
 
     if (RETRYABLE_STATUS.has(res.status) && attempt < maxAttempts) {
-      await sleep(attempt * 2000);
+      await sleep(attempt * (res.status === 429 ? 4000 : 2000));
       continue;
     }
 

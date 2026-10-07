@@ -1,5 +1,7 @@
 import { put, del } from "@vercel/blob";
 
+export { sampleKey, samplePrefix, isSampleBlobUrl } from "./keys";
+
 /**
  * Thin wrapper around Vercel Blob so nothing else in the app talks to the
  * Blob SDK directly. putFile returns the blob's public URL — callers store
@@ -36,10 +38,6 @@ export async function deleteFile(url: string): Promise<void> {
   await del(url).catch(() => {});
 }
 
-export function sampleKey(companyId: string, sampleId: string, filename: string) {
-  return `companies/${companyId}/samples/${sampleId}-${sanitize(filename)}`;
-}
-
 export function assetKey(companyId: string, templateVersionId: string, kind: string, ext: string) {
   return `companies/${companyId}/templates/${templateVersionId}/${kind}.${ext}`;
 }
@@ -51,8 +49,4 @@ export function brandingKey(companyId: string, kind: "logo" | "signature", ext: 
 
 export function quoteKey(companyId: string, quoteId: string) {
   return `companies/${companyId}/quotes/${quoteId}.pdf`;
-}
-
-function sanitize(name: string) {
-  return name.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-80);
 }

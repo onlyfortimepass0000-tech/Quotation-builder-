@@ -8,12 +8,26 @@ export interface ExtractionResult {
   };
 }
 
+/** One rendered page, as sent from the browser to /extract-page. */
+export interface PageImage {
+  /** base64 image data, no data: prefix */
+  base64: string;
+  mimeType: "image/jpeg" | "image/png";
+  pageIndex: number;
+  /**
+   * Exact text read from the PDF's own text layer (digital PDFs). When set,
+   * the provider only needs to describe the layout, not transcribe — faster,
+   * and the text is exact instead of OCR'd.
+   */
+  knownText?: string;
+}
+
 export interface ImageToTextProvider {
   readonly id: string;
   readonly label: string;
   /** true if this adapter is actually callable right now (has credentials / entitlement). */
   readonly available: boolean;
-  extractFromImage(pngBase64: string, pageIndex: number): Promise<ExtractionResult>;
+  extractFromImage(page: PageImage): Promise<ExtractionResult>;
 }
 
 export interface TextAnalysisProvider {
@@ -57,7 +71,12 @@ export interface AssetLocatorProvider {
   readonly id: string;
   readonly label: string;
   readonly available: boolean;
-  locateAssets(pngBase64: string, imageWidth: number, imageHeight: number): Promise<AssetLocation>;
+  locateAssets(
+    imageBase64: string,
+    mimeType: PageImage["mimeType"],
+    imageWidth: number,
+    imageHeight: number
+  ): Promise<AssetLocation>;
 }
 
 export class ProviderUnavailableError extends Error {

@@ -2,7 +2,7 @@ import { nanoid } from "nanoid";
 import { eq, and, desc } from "drizzle-orm";
 import { getDb } from "@/db/client";
 import { templateVersions, uploadedSamples, companies } from "@/db/schema";
-import { getActiveImageToTextProvider, getActiveTextAnalysisProvider } from "@/lib/ai/registry";
+import { getActiveTextAnalysisProvider } from "@/lib/ai/registry";
 import type { StageBResult, TemplateAssets } from "@/lib/template-schema";
 import type { ExtractionResult } from "@/lib/ai/types";
 import { putFile, assetKey } from "@/lib/storage";
@@ -30,16 +30,72 @@ async function getNextVersionNumber(companyId: string): Promise<number> {
 }
 
 /**
- * Stage A (per sample, per page) + Stage B (structural analysis across all
- * samples, with the prior approved template as context for incremental
- * re-learning) -> a new `pending_review` template_version row.
+ * Stage B prompt budget per sample, in characters (~12k tokens). A long
+ * quotation is mostly more rows of the same items table; past this budget
+ * the middle pages are left out of the PROMPT (never out of the stored
+ * extraction) so the text model stays fast and inside its context window.
+ * The first and last pages always go in: header, client block, totals,
+ * terms and signature live there.
+ */
+const STAGE_B_CHARS_PER_SAMPLE = 48_000;
+
+export function combinePagesForPrompt(
+  pages: ExtractionResult[],
+  budget = STAGE_B_CHARS_PER_SAMPLE
+): ExtractionResult {
+  const order: number[] = [];
+  for (let lo = 0, hi = pages.length - 1; lo <= hi; lo++, hi--) {
+    order.push(lo);
+    if (hi !== lo) order.push(hi);
+  }
+  const keep = new Set<number>();
+  let used = 0;
+  for (const i of order) {
+    const size = pages[i].rawText.length;
+    // Always keep the first and last page, even if they alone exceed the budget.
+    if (keep.size >= 2 && used + size > budget) continue;
+    keep.add(i);
+    used += size;
+  }
+
+  const text: string[] = [];
+  const descriptions: string[] = [];
+  let skippedFrom = -1;
+  const flushSkipped = (end: number) => {
+    if (skippedFrom === -1) return;
+    const range = skippedFrom === end ? `page ${skippedFrom + 1}` : `pages ${skippedFrom + 1}-${end + 1}`;
+    text.push(`[${range} omitted for length — same document continues]`);
+    skippedFrom = -1;
+  };
+  pages.forEach((page, i) => {
+    if (!keep.has(i)) {
+      if (skippedFrom === -1) skippedFrom = i;
+      return;
+    }
+    flushSkipped(i - 1);
+    text.push(page.rawText);
+    descriptions.push(page.layoutHints.description);
+  });
+  flushSkipped(pages.length - 1);
+
+  return {
+    rawText: text.join("\n\n"),
+    layoutHints: { description: descriptions.join(" | ") },
+  };
+}
+
+/**
+ * Stage B (structural analysis across all samples, with the prior approved
+ * template as context for incremental re-learning) -> a new `pending_review`
+ * template_version row. Stage A already ran per page via /extract-page.
  *
  * Never touches `companies.active_template_version_id` — that only moves on
  * explicit human approval (see pipeline/approve.ts).
  */
 export async function runAnalysis(params: {
   companyId: string;
-  samples: Array<{ sampleId: string; originalFilename: string; pngPages: string[] }>;
+  /** Stage A output for every page of every sample, in page order. */
+  samples: Array<{ sampleId: string; pages: ExtractionResult[] }>;
   /** Owner opted in to replacing logo/signature/terms from THIS upload. */
   updateBranding?: boolean;
   /** Pre-cropped (client-side) logo image, only present when updateBranding && detection found one. */
@@ -49,7 +105,6 @@ export async function runAnalysis(params: {
   const { companyId, samples, updateBranding = false, logoCropBytes, signatureCropBytes } = params;
   if (samples.length === 0) throw new Error("No samples to analyze");
 
-  const visionProvider = await getActiveImageToTextProvider();
   const textProvider = await getActiveTextAnalysisProvider();
 
   const db = await getDb();
@@ -65,30 +120,14 @@ export async function runAnalysis(params: {
       }
     : undefined;
 
-  // Stage A fans out across every sample and every page within it — each
-  // call is independent (round-robins across the 4 API keys), so running
-  // them concurrently instead of one-at-a-time is a straight latency win
-  // whenever more than one sample/page is uploaded together.
-  const combinedPerSample = await Promise.all(
-    samples.map(async (sample) => {
-      const pageResults = await Promise.all(
-        sample.pngPages.map((png, i) => visionProvider.extractFromImage(png, i))
-      );
-      const combined: ExtractionResult = {
-        rawText: pageResults.map((p) => p.rawText).join("\n\n"),
-        layoutHints: {
-          description: pageResults.map((p) => p.layoutHints.description).join(" | "),
-        },
-      };
-      return { sampleId: sample.sampleId, combined };
-    })
-  );
-
-  const perSampleExtractions = combinedPerSample.map((s) => s.combined);
-  const rawExtraction = combinedPerSample.map((s) => ({
+  const perSampleExtractions = samples.map((s) => combinePagesForPrompt(s.pages));
+  // Stored for the review screen + debugging: every page, never truncated.
+  const rawExtraction = samples.map((s) => ({
     sampleId: s.sampleId,
-    rawText: s.combined.rawText,
-    layoutHints: s.combined.layoutHints,
+    rawText: s.pages.map((p) => p.rawText).join("\n\n"),
+    layoutHints: {
+      description: s.pages.map((p) => p.layoutHints.description).join(" | "),
+    },
   }));
 
   const stageBResult = await textProvider.analyzeStructure(perSampleExtractions, priorTemplate);
