@@ -25,7 +25,7 @@ Migrated from Cloudflare (D1 + R2) to **Vercel + Neon Postgres + Vercel Blob**.
 1. `npm install`
 2. Push to GitHub, import repo in Vercel (framework: Next.js, root = repo root).
 3. Add env vars above, link a Blob store.
-4. Create tables: `DATABASE_URL=... npx drizzle-kit push`
+4. Create tables: paste `drizzle/0000_init.sql` into Neon's SQL Editor and run it (or `DATABASE_URL=... npx drizzle-kit migrate`)
 5. Redeploy.
 
 ## Known gaps
