@@ -1,0 +1,68 @@
+import type { StageBResult } from "@/lib/template-schema";
+
+export interface ExtractionResult {
+  rawText: string;
+  layoutHints: {
+    /** Free-text description of what the vision model saw spatially. */
+    description: string;
+  };
+}
+
+export interface ImageToTextProvider {
+  readonly id: string;
+  readonly label: string;
+  /** true if this adapter is actually callable right now (has credentials / entitlement). */
+  readonly available: boolean;
+  extractFromImage(pngBase64: string, pageIndex: number): Promise<ExtractionResult>;
+}
+
+export interface TextAnalysisProvider {
+  readonly id: string;
+  readonly label: string;
+  readonly available: boolean;
+  analyzeStructure(
+    samples: ExtractionResult[],
+    priorTemplate?: StageBResult
+  ): Promise<StageBResult>;
+}
+
+/** Pixel box, (0,0) at top-left of the source image, x/y/width/height in px. */
+export interface PixelBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface DetectedAsset {
+  present: boolean;
+  box?: PixelBox;
+  /** 0-1: how confident the model is that `box` actually bounds the element. */
+  confidence: number;
+}
+
+export interface AssetLocation {
+  logo: DetectedAsset;
+  signature: DetectedAsset;
+}
+
+/**
+ * A model built for spatial grounding (unlike the general Stage A vision
+ * model, which measurably cannot return usable bounding boxes — see
+ * README.md). Used only to get an approximate region to crop; the crop is
+ * always padded generously since the coordinates are best-effort, never
+ * pixel-exact.
+ */
+export interface AssetLocatorProvider {
+  readonly id: string;
+  readonly label: string;
+  readonly available: boolean;
+  locateAssets(pngBase64: string, imageWidth: number, imageHeight: number): Promise<AssetLocation>;
+}
+
+export class ProviderUnavailableError extends Error {
+  constructor(providerId: string, reason: string) {
+    super(`AI provider "${providerId}" is not available: ${reason}`);
+    this.name = "ProviderUnavailableError";
+  }
+}
